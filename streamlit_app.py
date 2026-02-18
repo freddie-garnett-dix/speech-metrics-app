@@ -5,131 +5,161 @@ import wave
 import streamlit as st
 from openai import OpenAI
 
+
+# -----------------------------
+# Page + header
+# -----------------------------
 st.set_page_config(page_title="Speech Metrics", page_icon="🎤")
 
 st.title("🎤 Speech Metrics (Prototype)")
-st.caption("Build: v1.4 – transcript + duration + WPM + filler%")
+st.caption("Build: v1.4 – transcript + duration + WPM + fillers% + repetition% (WAV only)")
+st.write("Upload a **WAV** file and we’ll transcribe it + calculate a few basic metrics.")
 
-st.write("Upload a WAV file and we’ll transcribe it + calculate a few basic metrics.")
 
-audio_file = st.file_uploader("Upload WAV audio", type=["wav"])
+# -----------------------------
+# Helpers
+# -----------------------------
+def wav_duration_seconds(wav_bytes: bytes) -> float:
+    """Compute duration from WAV headers (no ffmpeg needed)."""
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        frames = wf.getnframes()
+        rate = wf.getframerate()
+        if rate == 0:
+            return 0.0
+        return frames / float(rate)
 
-# Keep filler list small + obvious (you can expand later)
-FILLER_SINGLE = {
-    "um", "uh", "erm", "er", "ah", "like", "basically", "actually", "literally"
+
+def tokenise_words(text: str) -> list[str]:
+    # Simple word tokeniser (letters + apostrophes)
+    return re.findall(r"[a-zA-Z']+", text.lower())
+
+
+FILLER_SINGLE_WORDS = {
+    "um", "uh", "erm", "er", "emm", "err",  # added emm/err
+    "ah", "like", "basically", "actually", "literally",
 }
+
 FILLER_PHRASES = [
     "you know",
     "sort of",
     "kind of",
 ]
 
-def count_fillers(text: str) -> tuple[int, dict]:
+
+def count_fillers(text: str) -> tuple[int, int, int]:
     """
     Returns:
-      total_filler_hits, breakdown_dict
+      filler_word_equivalents, single_word_fillers, phrase_hits_word_equivalents
     """
-    t = text.lower()
+    lower = text.lower()
+    words = tokenise_words(lower)
 
-    # Tokenise into words (simple, robust)
-    words = re.findall(r"[a-z']+", t)
+    single_hits = sum(1 for w in words if w in FILLER_SINGLE_WORDS)
 
-    breakdown = {w: 0 for w in sorted(FILLER_SINGLE)}
-    total = 0
-
-    # Single-word fillers
-    for w in words:
-        if w in FILLER_SINGLE:
-            breakdown[w] += 1
-            total += 1
-
-    # Multi-word phrases (count occurrences in raw string)
+    # Phrase hits – count occurrences and convert to "word equivalents"
+    phrase_word_equiv = 0
     for phrase in FILLER_PHRASES:
-        hits = len(re.findall(rf"\b{re.escape(phrase)}\b", t))
-        breakdown[phrase] = hits
-        total += hits
+        # Count non-overlapping occurrences
+        hits = len(re.findall(rf"\b{re.escape(phrase)}\b", lower))
+        phrase_word_equiv += hits * len(phrase.split())
 
-    # Remove zeros in breakdown for tidy display
-    breakdown = {k: v for k, v in breakdown.items() if v > 0}
-    return total, breakdown
+    filler_word_equiv_total = single_hits + phrase_word_equiv
+    return filler_word_equiv_total, single_hits, phrase_word_equiv
 
-def wav_duration_seconds(wav_bytes: bytes) -> float:
-    """
-    Reads WAV header to calculate duration (no ffmpeg, no extra deps).
-    """
-    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
-        frames = wf.getnframes()
-        rate = wf.getframerate()
-        return frames / float(rate)
+
+def count_immediate_repetitions(text: str) -> int:
+    """Counts immediate repeated words: 'because because'."""
+    words = tokenise_words(text)
+    repeats = 0
+    for i in range(1, len(words)):
+        if words[i] == words[i - 1]:
+            repeats += 1
+    return repeats
+
+
+def get_transcript_text(transcript_obj) -> str:
+    """Works whether SDK returns a dict-like object or a model with .text."""
+    # Most common: transcript.text
+    t = getattr(transcript_obj, "text", None)
+    if isinstance(t, str) and t.strip():
+        return t
+
+    # Sometimes dict-like
+    try:
+        t2 = transcript_obj.get("text", "")
+        if isinstance(t2, str):
+            return t2
+    except Exception:
+        pass
+
+    return ""
+
+
+# -----------------------------
+# Upload
+# -----------------------------
+audio_file = st.file_uploader("Upload WAV audio", type=["wav"])
 
 if audio_file is not None:
     st.success("File uploaded successfully!")
 
-    audio_bytes = audio_file.read()
+    wav_bytes = audio_file.read()
+    duration_sec = wav_duration_seconds(wav_bytes)
 
-    # Duration
-    try:
-        duration_sec = wav_duration_seconds(audio_bytes)
-    except Exception:
-        st.error("Could not read WAV duration. Is this a valid WAV file?")
-        st.stop()
-
-    # OpenAI key check
+    # -----------------------------
+    # Transcription
+    # -----------------------------
     if "OPENAI_API_KEY" not in st.secrets:
-        st.error("Missing OPENAI_API_KEY in Streamlit Secrets (Manage app → Settings → Secrets).")
+        st.error(
+            "Missing OPENAI_API_KEY in Streamlit Secrets.\n\n"
+            "Go to **Manage app → Settings → Secrets** and add:\n"
+            'OPENAI_API_KEY="sk-..."'
+        )
         st.stop()
 
     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-    # Transcription
-    try:
-        with st.spinner("Transcribing audio..."):
-            transcript = client.audio.transcriptions.create(
-                model="gpt-4o-transcribe",
-                file=("audio.wav", audio_bytes),
-                response_format="json",
-            )
+    with st.spinner("Transcribing audio..."):
+        transcript = client.audio.transcriptions.create(
+            model="gpt-4o-transcribe",
+            file=("audio.wav", wav_bytes),
+            response_format="json",
+        )
 
-        # IMPORTANT: transcript is a Pydantic object in newer SDKs, so use .text
-        text = getattr(transcript, "text", None)
-        if not text:
-            # fallback if ever returned dict-like
-            try:
-                text = transcript["text"]
-            except Exception:
-                text = ""
+    text = get_transcript_text(transcript)
 
-        if not text.strip():
-            st.error("Transcript came back empty.")
-            st.stop()
-
-    except Exception as e:
-        st.error("Transcription failed.")
-        st.exception(e)
-        st.stop()
-
-    # Metrics from transcript
-    words = re.findall(r"[a-z']+", text.lower())
+    # -----------------------------
+    # Metrics (no interpretation)
+    # -----------------------------
+    words = tokenise_words(text)
     word_count = len(words)
+    minutes = duration_sec / 60.0 if duration_sec > 0 else 0.0
+    wpm = (word_count / minutes) if minutes > 0 else 0.0
 
-    minutes = max(duration_sec / 60.0, 1e-9)
-    wpm = word_count / minutes
+    filler_word_equiv, filler_single_hits, filler_phrase_word_equiv = count_fillers(text)
+    filler_pct = (filler_word_equiv / word_count * 100.0) if word_count > 0 else 0.0
 
-    filler_count, filler_breakdown = count_fillers(text)
-    filler_pct = (filler_count / max(word_count, 1)) * 100
+    repetition_count = count_immediate_repetitions(text)
+    repetition_pct = (repetition_count / word_count * 100.0) if word_count > 0 else 0.0
 
-    # Output metrics
     st.subheader("Key metrics")
-    col1, col2, col3, col4 = st.columns(4)
 
-    col1.metric("Duration", f"{duration_sec:.1f}s")
-    col2.metric("Words", f"{word_count}")
-    col3.metric("WPM", f"{round(wpm):d}")
-    col4.metric("Filler %", f"{filler_pct:.1f}%")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Duration", f"{duration_sec:.1f}s")
+    c2.metric("Words", f"{word_count}")
+    c3.metric("WPM", f"{wpm:.0f}")
+    c4.metric("Filler %", f"{filler_pct:.1f}%")
+    c5.metric("Repetition %", f"{repetition_pct:.1f}%")
 
-    if filler_breakdown:
-        st.caption("Filler breakdown (counts)")
-        st.json(filler_breakdown)
+    with st.expander("Metric breakdown (counts)"):
+        st.write(
+            {
+                "filler_word_equivalents_total": filler_word_equiv,
+                "single_word_fillers_count": filler_single_hits,
+                "phrase_filler_word_equivalents": filler_phrase_word_equiv,
+                "immediate_repetitions_count": repetition_count,
+            }
+        )
 
     st.subheader("Transcript")
-    st.write(text)
+    st.write(text if text else "(No transcript text returned.)")
