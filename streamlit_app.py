@@ -1,126 +1,164 @@
+import io
 import re
-from collections import Counter
+import wave
+import audioop
 import streamlit as st
 from openai import OpenAI
 
-st.set_page_config(page_title="PowerLoom Speech Metrics", page_icon="🎤")
-st.title("🎤 PowerLoom Speech Metrics App")
-st.write("Upload an audio file to analyse speaking performance (v1 – transcript metrics).")
+st.set_page_config(page_title="Speech Metrics", page_icon="🎤")
 
-audio_file = st.file_uploader("Upload audio", type=["wav", "mp3", "m4a"])
+st.title("🎤 Speech Metrics (Prototype)")
+# Change this line each deploy so you can see the update instantly
+st.caption("Build: v1.2 – core metrics only (WPM, pauses%, fillers%)")
 
-FILLERS = [
-    "um", "uh", "er", "ah", "like", "you know", "sort of", "kind of",
-    "basically", "actually", "literally", "right", "so"
+st.write("Upload a **WAV** file. (WAV only keeps pause detection reliable on Streamlit Cloud.)")
+
+audio_file = st.file_uploader("Upload WAV audio", type=["wav"])
+
+FILLER_WORDS = [
+    "um", "uh", "er", "ah", "like", "basically", "actually", "literally", "right"
+]
+FILLER_PHRASES = [
+    "you know", "sort of", "kind of"
 ]
 
-STOPWORDS = set([
-    "the","a","an","and","or","but","if","then","so","because","as","of","to","in",
-    "on","for","with","at","by","from","up","down","out","about","into","over",
-    "after","before","between","through","during","without","within",
-    "i","you","we","they","he","she","it","me","him","her","us","them",
-    "my","your","our","their","this","that","these","those","is","are","was","were",
-    "be","been","being","do","does","did","have","has","had","will","would","can",
-    "could","should","may","might","must"
-])
-
-def normalise_text(t: str) -> str:
-    t = t.lower()
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-def tokenise_words(t: str):
-    return re.findall(r"[a-z']+", t.lower())
+def tokenise_words(text: str):
+    return re.findall(r"[a-z']+", text.lower())
 
 def count_fillers(text: str):
-    t = normalise_text(text)
-    counts = {}
-    for f in FILLERS:
-        # phrase-aware counting
-        pattern = r"\b" + re.escape(f) + r"\b"
-        counts[f] = len(re.findall(pattern, t))
-    total = sum(counts.values())
-    return total, {k:v for k,v in counts.items() if v > 0}
+    t = text.lower()
+    words = tokenise_words(t)
+    total_words = len(words)
 
-def repetition(words):
-    content = [w for w in words if w not in STOPWORDS]
-    c = Counter(content)
-    top = c.most_common(15)
-    # repeated words = count beyond first occurrence
-    repeated_excess = sum(max(0, n - 1) for _, n in c.items())
-    return repeated_excess, top
+    filler_count = 0
 
-def estimate_duration_seconds(uploaded_file):
-    # Streamlit doesn't always provide duration. We'll show "Unknown" unless available.
-    # For WAV we could parse headers, but let's keep v1 simple.
-    return None
+    # single-word fillers
+    filler_set = set(FILLER_WORDS)
+    filler_count += sum(1 for w in words if w in filler_set)
+
+    # phrase fillers (count occurrences with word boundaries)
+    for phrase in FILLER_PHRASES:
+        filler_count += len(re.findall(r"\b" + re.escape(phrase) + r"\b", t))
+
+    filler_pct = (filler_count / total_words * 100) if total_words else 0.0
+    return total_words, filler_count, filler_pct
+
+def analyse_pauses_from_wav_bytes(
+    wav_bytes: bytes,
+    window_ms: int = 20,
+    silence_rms_threshold: int = 200,
+    min_pause_ms: int = 200,
+    long_pause_ms: int = 2000,
+):
+    """
+    Pure-Python pause detection from WAV (no ffmpeg).
+    Uses RMS energy per window; windows below threshold are treated as silence.
+
+    Returns:
+      duration_s, pause_s, pause_pct, long_pause_count
+    """
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        nchannels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        framerate = wf.getframerate()
+        nframes = wf.getnframes()
+
+        duration_s = nframes / float(framerate)
+
+        # frames per analysis window
+        frames_per_window = int(framerate * (window_ms / 1000.0))
+        if frames_per_window <= 0:
+            frames_per_window = 1
+
+        silent_windows = []
+        total_windows = 0
+
+        wf.rewind()
+        while True:
+            frames = wf.readframes(frames_per_window)
+            if not frames:
+                break
+            total_windows += 1
+
+            # Convert to mono RMS if stereo: audioop.rms works on raw bytes regardless of channels,
+            # but stereo RMS tends to be higher; we keep a single threshold for simplicity.
+            rms = audioop.rms(frames, sampwidth)
+
+            silent_windows.append(rms < silence_rms_threshold)
+
+        # Convert silent windows into contiguous pause segments
+        window_s = window_ms / 1000.0
+        min_pause_windows = max(1, int(min_pause_ms / window_ms))
+        long_pause_windows = max(1, int(long_pause_ms / window_ms))
+
+        pause_s = 0.0
+        long_pause_count = 0
+
+        run = 0
+        for is_silent in silent_windows + [False]:  # sentinel to flush last run
+            if is_silent:
+                run += 1
+            else:
+                if run >= min_pause_windows:
+                    pause_len_s = run * window_s
+                    pause_s += pause_len_s
+                    if run >= long_pause_windows:
+                        long_pause_count += 1
+                run = 0
+
+        pause_pct = (pause_s / duration_s * 100) if duration_s > 0 else 0.0
+        return duration_s, pause_s, pause_pct, long_pause_count
 
 if audio_file is not None:
+    wav_bytes = audio_file.read()
+
+    # --- Pause metrics (audio-based, reliable on WAV) ---
+    with st.spinner("Calculating pause metrics..."):
+        duration_s, pause_s, pause_pct, long_pause_count = analyse_pauses_from_wav_bytes(
+            wav_bytes,
+            window_ms=20,
+            silence_rms_threshold=200,  # tweak later if needed
+            min_pause_ms=200,
+            long_pause_ms=2000,
+        )
+
+    # --- Transcription (text-based) ---
     if "OPENAI_API_KEY" not in st.secrets:
-        st.error("Missing OPENAI_API_KEY in Streamlit Secrets")
+        st.error('Missing OPENAI_API_KEY in Streamlit Secrets (Manage app → Settings → Secrets).')
         st.stop()
 
-    audio_bytes = audio_file.read()
     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
     with st.spinner("Transcribing audio..."):
         transcript = client.audio.transcriptions.create(
             model="gpt-4o-transcribe",
-            file=(audio_file.name, audio_bytes),
+            file=("audio.wav", wav_bytes),
             response_format="json",
-            # OPTIONAL: try word timestamps (if supported). If not supported, it will just ignore / error.
-            # timestamp_granularities=["word"]
         )
 
     text = transcript.get("text", "")
-    words = tokenise_words(text)
+    total_words, filler_count, filler_pct = count_fillers(text)
 
-    total_words = len(words)
-    duration_sec = estimate_duration_seconds(audio_file)
+    # --- WPM ---
+    minutes = duration_s / 60.0 if duration_s > 0 else 0
+    wpm = (total_words / minutes) if minutes > 0 else 0.0
 
-    # Basic pace based on total audio duration (if known)
-    wpm = None
-    if duration_sec and duration_sec > 0:
-        wpm = (total_words / (duration_sec / 60.0))
+    # --- Output (metrics only, no interpretation) ---
+    st.subheader("Key metrics")
 
-    filler_total, filler_breakdown = count_fillers(text)
-    filler_pct = (filler_total / total_words * 100) if total_words else 0
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Duration (s)", f"{duration_s:.1f}")
+    c2.metric("Total words", f"{total_words}")
+    c3.metric("WPM", f"{wpm:.0f}")
+    c4.metric("Pause %", f"{pause_pct:.1f}%")
+    c5.metric("Filler %", f"{filler_pct:.1f}%")
 
-    repeated_excess, top_repeated = repetition(words)
+    st.caption("Pause % is calculated from the audio waveform (silence windows). Fillers are counted from the transcript.")
 
-    # Simple sentence stats
-    sentences = [s for s in re.split(r"[.!?]+", text.strip()) if s.strip()]
-    sentence_count = len(sentences)
-    avg_sentence_len = (total_words / sentence_count) if sentence_count else 0
-    longest_sentence_len = max((len(tokenise_words(s)) for s in sentences), default=0)
-    questions = text.count("?")
-
-    st.subheader("Summary")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total words", f"{total_words}")
-    c2.metric("Filler %", f"{filler_pct:.1f}%")
-    c3.metric("Filler count", f"{filler_total}")
-    if wpm is None:
-        c4.metric("WPM", "—")
-        st.caption("WPM requires audio duration. We can add duration extraction next.")
-    else:
-        c4.metric("WPM", f"{wpm:.0f}")
-
-    st.subheader("Delivery metrics")
-    d1, d2, d3, d4 = st.columns(4)
-    d1.metric("Sentences", f"{sentence_count}")
-    d2.metric("Avg sentence length", f"{avg_sentence_len:.1f} words")
-    d3.metric("Longest sentence", f"{longest_sentence_len} words")
-    d4.metric("Questions", f"{questions}")
-
-    st.subheader("Filler words breakdown")
-    if filler_breakdown:
-        st.table([{"filler": k, "count": v} for k, v in sorted(filler_breakdown.items(), key=lambda x: -x[1])])
-    else:
-        st.info("No filler words detected (based on the current filler list).")
-
-    st.subheader("Repetition (top words, excluding common stopwords)")
-    st.table([{"word": w, "count": n} for w, n in top_repeated])
+    st.subheader("Extra (small)")
+    c6, c7 = st.columns(2)
+    c6.metric("Total pause time (s)", f"{pause_s:.1f}")
+    c7.metric("Long pauses (≥2.0s)", f"{long_pause_count}")
 
     st.subheader("Transcript")
     st.write(text)
